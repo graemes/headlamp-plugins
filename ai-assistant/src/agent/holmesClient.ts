@@ -1,9 +1,8 @@
-import { HttpAgent } from '@ag-ui/client';
 import { clusterRequest } from '@kinvolk/headlamp-plugin/lib/ApiProxy';
 import type { PluginConfig } from '../utils';
 
 /**
- * Default base URL for the Holmes ag-ui server (direct / port-forward fallback).
+ * Default base URL for the Holmes server (direct / port-forward fallback).
  */
 export const DEFAULT_AGUI_URL = 'http://localhost:5050';
 
@@ -41,8 +40,6 @@ function getHolmesServiceConfig(config?: PluginConfig): {
  *
  * Path pattern:
  *   /api/v1/namespaces/{ns}/services/{svc}:{port}/proxy[/{subPath}]
- *
- * This path can be used with Headlamp's `clusterRequest()` directly.
  */
 export function getHolmesServiceProxyPath(config?: PluginConfig, subPath = ''): string {
   const { namespace, serviceName, servicePort } = getHolmesServiceConfig(config);
@@ -52,11 +49,6 @@ export function getHolmesServiceProxyPath(config?: PluginConfig, subPath = ''): 
 
 /**
  * Check if the Holmes agent is reachable via the K8s service proxy.
- * Uses the service proxy base path — the K8s API server returns 503 if
- * there are no ready endpoints, so a non-503 response means the pod is up.
- *
- * We probe the root path (/) which uvicorn will respond to (even with 404/405)
- * rather than /healthz which the experimental server may not implement.
  */
 export async function checkHolmesAgentHealth(
   cluster: string,
@@ -70,9 +62,6 @@ export async function checkHolmesAgentHealth(
     });
     return true;
   } catch (err: any) {
-    // A 404/405 from the Holmes server itself means the pod IS reachable
-    // (the K8s service proxy forwarded the request successfully).
-    // Only 503 "no endpoints" or network errors mean it's truly unavailable.
     const status = err?.status;
     if (status === 404 || status === 405 || status === 422) {
       return true;
@@ -83,15 +72,8 @@ export async function checkHolmesAgentHealth(
 
 /**
  * Resolve the Headlamp backend origin.
- *
- * Replicates the logic from Headlamp's internal `getAppUrl()` so that we can
- * build absolute URLs for `HttpAgent` (which calls raw `fetch`).
- *
- * In dev mode the Vite dev-server runs on :3000 but the Headlamp backend
- * that proxies to the K8s API server runs on :4466, so we must target :4466.
  */
 function getHeadlampBackendOrigin(): string {
-  // Electron environment
   if (
     typeof window !== 'undefined' &&
     ((typeof window.process === 'object' && (window.process as any).type === 'renderer') ||
@@ -101,12 +83,10 @@ function getHeadlampBackendOrigin(): string {
     return `http://localhost:${port}`;
   }
 
-  // Docker Desktop
   if (typeof window !== 'undefined' && (window as any).ddClient !== undefined) {
     return 'http://localhost:64446';
   }
 
-  // Dev mode (vite dev server on :3000, backend on :4466)
   try {
     if ((import.meta as any).env?.DEV) {
       return 'http://localhost:4466';
@@ -115,20 +95,15 @@ function getHeadlampBackendOrigin(): string {
     // import.meta may not be available in all contexts
   }
 
-  // Production — backend is at the same origin
   return window.location.origin;
 }
 
 /**
- * Build the full Holmes ag-ui base URL that routes through Headlamp's backend
+ * Build the full Holmes base URL that routes through Headlamp's backend
  * proxy → Kubernetes API server → Holmes Service.
- *
- * The returned URL is absolute (includes the Headlamp backend origin) so that
- * it can be passed directly to `HttpAgent` / `fetch`.
  */
 export function getHolmesProxyBaseUrl(cluster: string, config?: PluginConfig): string {
   const origin = getHeadlampBackendOrigin();
-  // Respect any base URL prefix (e.g. /headlamp)
   let baseUrlPrefix = '';
   if (typeof window !== 'undefined' && (window as any).headlampBaseUrl) {
     const raw = (window as any).headlampBaseUrl as string;
@@ -139,120 +114,228 @@ export function getHolmesProxyBaseUrl(cluster: string, config?: PluginConfig): s
   return `${origin}${baseUrlPrefix}/clusters/${cluster}${getHolmesServiceProxyPath(config, '')}`;
 }
 
+// ─── Holmes SSE event shapes ───────────────────────────────────────────────
+
+interface HolmesStartToolCallingEvent {
+  tool_name: string;
+  id: string;
+}
+
+interface HolmesToolCallingResultEvent {
+  tool_call_id: string;
+  tool_name: string;
+}
+
+interface HolmesAiAnswerEndEvent {
+  analysis: string;
+  conversation_history: object[];
+}
+
+
+// ─── Subscriber interface ──────────────────────────────────────────────────
+
+interface HolmesSubscriber {
+  onEvent?: (args: { event: any }) => void;
+  onRunInitialized?: () => void;
+  onRunFailed?: (args: { error: any }) => void;
+  onRunFinalized?: () => void;
+  onRunStartedEvent?: () => void;
+  onRunFinishedEvent?: () => void;
+  onRunErrorEvent?: (args: { event: { message: string } }) => void;
+  onTextMessageStartEvent?: (args: { event: { messageId: string } }) => void;
+  onTextMessageContentEvent?: (args: { event: { delta: string } }) => void;
+  onTextMessageEndEvent?: () => void;
+  onToolCallStartEvent?: (args: { event: { toolCallName: string; toolCallId?: string } }) => void;
+  onToolCallEndEvent?: (args: { toolCallName: string }) => void;
+}
+
 /**
- * HolmesAgent wraps @ag-ui/client's HttpAgent to communicate with the
- * Holmes ag-ui server via SSE.
+ * HolmesAgent talks to the Holmes /api/chat SSE endpoint.
  *
- * Usage:
- *   const agent = new HolmesAgent(getHolmesProxyBaseUrl(cluster, pluginSettings));
- *   agent.subscribe({ onTextMessageContentEvent: ... });
- *   agent.addMessage({ id: '1', role: 'user', content: 'What pods are failing?' });
- *   await agent.runAgent({ runId: 'run-1' });
+ * Mapping from Holmes SSE events to subscriber callbacks:
+ *   start_tool_calling   → onToolCallStartEvent
+ *   tool_calling_result  → onToolCallEndEvent
+ *   ai_answer_end        → onTextMessage{Start,Content,End}Event + onRunFinishedEvent
+ *   token_count          → ignored
+ *   ai_message           → ignored (channel-marker format; clean text comes from ai_answer_end)
+ *
+ * Conversation history is preserved across calls via ai_answer_end.conversation_history,
+ * enabling multi-turn chat. Call resetThread() to start a fresh conversation.
  */
 export class HolmesAgent {
-  private agent: HttpAgent;
   private baseUrl: string;
   private threadId: string;
-  private subscriberList: any[] = [];
-
-  // Buffers for accumulating streamed content (since the library's buffers
-  // can be unreliable depending on version)
-  private toolArgsBuffers: Map<string, string> = new Map();
-  private toolNames: Map<string, string> = new Map();
+  private subscribers: HolmesSubscriber[] = [];
+  private conversationHistory: object[] = [];
+  private pendingAsk: string = '';
+  private abortController: AbortController | null = null;
 
   constructor(baseUrl: string = DEFAULT_AGUI_URL) {
     this.baseUrl = baseUrl;
     this.threadId = `thread-${Date.now()}`;
-    this.agent = this.createAgent();
   }
 
-  private createAgent(): HttpAgent {
-    const url = `${this.baseUrl}/api/agui/chat`;
-    console.log('[HolmesAgent] Creating HttpAgent with URL:', url);
-    return new HttpAgent({
-      url,
-      threadId: this.threadId,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-    });
-  }
-
-  /**
-   * A human-readable label for the current connection.
-   */
   get connectionLabel(): string {
     return this.baseUrl;
   }
 
-  /**
-   * Subscribe to agent events.
-   *
-   * Callbacks:
-   * - onRunStartedEvent / onRunFinishedEvent / onRunErrorEvent
-   * - onTextMessageStartEvent / onTextMessageContentEvent / onTextMessageEndEvent
-   * - onToolCallStartEvent / onToolCallArgsEvent / onToolCallEndEvent
-   */
-  subscribe(subscriber: any): { unsubscribe: () => void } {
-    this.subscriberList.push(subscriber);
-    const sub = this.agent.subscribe(subscriber);
+  subscribe(subscriber: HolmesSubscriber): { unsubscribe: () => void } {
+    this.subscribers.push(subscriber);
     return {
       unsubscribe: () => {
-        sub.unsubscribe();
-        this.subscriberList = this.subscriberList.filter(s => s !== subscriber);
+        this.subscribers = this.subscribers.filter(s => s !== subscriber);
       },
     };
   }
 
-  /**
-   * Add a message to the agent's conversation history.
-   */
   addMessage(message: { id: string; role: string; content: string }): void {
-    this.agent.addMessage(message as any);
+    if (message.role === 'user') {
+      this.pendingAsk = message.content;
+    }
   }
 
-  /**
-   * Run the agent — sends accumulated messages to Holmes and streams back
-   * ag-ui events to all registered subscribers.
-   */
-  async runAgent(params?: {
-    runId?: string;
-    tools?: any[];
-    context?: any[];
-    forwardedProps?: Record<string, any>;
-  }): Promise<void> {
-    await this.agent.runAgent({
-      runId: params?.runId || `run-${Date.now()}`,
-      tools: params?.tools,
-      context: params?.context,
-      forwardedProps: params?.forwardedProps,
-    });
+  async runAgent(params?: { runId?: string; tools?: any[]; context?: any[]; forwardedProps?: Record<string, any> }): Promise<void> {
+    const ask = this.pendingAsk;
+    this.pendingAsk = '';
+
+    if (!ask) {
+      this.emit('onRunErrorEvent', { event: { message: 'No message to send' } });
+      return;
+    }
+
+    const url = `${this.baseUrl}/api/chat`;
+    const body: Record<string, any> = { ask, stream: true };
+    if (this.conversationHistory.length > 0) {
+      body.conversation_history = this.conversationHistory;
+    }
+
+    this.abortController = new AbortController();
+    this.emit('onRunStartedEvent');
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: this.abortController.signal,
+      });
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => response.statusText);
+        throw new Error(`HTTP ${response.status}: ${text}`);
+      }
+
+      if (!response.body) {
+        throw new Error('Response has no body');
+      }
+
+      await this.parseSSEStream(response.body);
+      this.emit('onRunFinishedEvent');
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        this.emit('onRunFinishedEvent');
+      } else {
+        this.emit('onRunErrorEvent', { event: { message: err?.message ?? 'Unknown error' } });
+      }
+    } finally {
+      this.abortController = null;
+    }
   }
 
-  /**
-   * Abort the currently running agent request.
-   */
+  private async parseSSEStream(body: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let currentEvent = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (line.startsWith('event:')) {
+            currentEvent = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            const raw = line.slice(5).trim();
+            if (raw && currentEvent) {
+              try {
+                this.handleHolmesEvent(currentEvent, JSON.parse(raw));
+              } catch {
+                // skip malformed JSON
+              }
+            }
+            currentEvent = '';
+          } else if (line === '') {
+            currentEvent = '';
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
+
+  private handleHolmesEvent(eventType: string, data: any): void {
+    switch (eventType) {
+      case 'start_tool_calling': {
+        const e = data as HolmesStartToolCallingEvent;
+        this.emit('onToolCallStartEvent', {
+          event: { toolCallName: e.tool_name, toolCallId: e.id },
+        });
+        break;
+      }
+
+      case 'tool_calling_result': {
+        const e = data as HolmesToolCallingResultEvent;
+        this.emit('onToolCallEndEvent', { toolCallName: e.tool_name });
+        break;
+      }
+
+      case 'ai_answer_end': {
+        const e = data as HolmesAiAnswerEndEvent;
+        if (e.conversation_history) {
+          this.conversationHistory = e.conversation_history;
+        }
+        const analysis = e.analysis?.trim() ?? '';
+        if (analysis) {
+          const msgId = `msg-${Date.now()}`;
+          this.emit('onTextMessageStartEvent', { event: { messageId: msgId } });
+          this.emit('onTextMessageContentEvent', { event: { delta: analysis } });
+          this.emit('onTextMessageEndEvent');
+        }
+        break;
+      }
+
+      // token_count and ai_message are informational; ignored.
+    }
+  }
+
+  private emit(eventName: string, ...args: any[]): void {
+    for (const sub of this.subscribers) {
+      const fn = (sub as any)[eventName];
+      if (typeof fn === 'function') {
+        fn(...args);
+      }
+    }
+  }
+
   abortRun(): void {
-    this.agent.abortRun();
+    this.abortController?.abort();
   }
 
-  /**
-   * Reset the conversation by creating a new agent instance with a fresh thread.
-   * All existing subscribers are automatically re-attached.
-   */
   resetThread(): void {
     this.threadId = `thread-${Date.now()}`;
-    this.agent = this.createAgent();
-    for (const sub of this.subscriberList) {
-      this.agent.subscribe(sub);
-    }
-    this.toolArgsBuffers.clear();
-    this.toolNames.clear();
+    this.conversationHistory = [];
+    this.pendingAsk = '';
+    this.abortController?.abort();
+    this.abortController = null;
   }
 
-  /**
-   * Get the current thread ID.
-   */
   getThreadId(): string {
     return this.threadId;
   }
